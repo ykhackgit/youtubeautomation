@@ -815,7 +815,10 @@ async def cancel_custom_music(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle incoming text messages and reply using the selected LLM."""
-    user_message = update.message.text
+    user_message = update.message.text or update.message.caption or ""
+    if not user_message and not update.message.photo and not update.message.document:
+        return
+        
     print(f"Received message from {update.effective_user.first_name}: {user_message}")
 
     # Send a "typing..." action so the user knows the bot is working
@@ -897,6 +900,74 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"Error calling API for {selected_model}: {e}", file=sys.stderr)
         await update.message.reply_text(f"Sorry, I encountered an error while processing your request with {selected_model}.")
 
+async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle incoming photos and documents."""
+    selected_model = context.user_data.get('selected_model', 'gemini')
+    if selected_model != 'browser':
+        await update.message.reply_text("The default Gemini API does not currently support image uploads in this bot. Please switch to 'Browser Gemini' using /select_model.")
+        return
+
+    # Check if initialization was attempted but completely failed to populate the key
+    if 'browser_session_started' not in context.bot_data:
+        await update.message.reply_text("⏳ Initializing Browser Gemini session in the background... please wait a moment and try again.")
+        return
+        
+    bs = context.bot_data.get('browser_session')
+    if not bs:
+        await update.message.reply_text("❌ The Browser Gemini session encountered a fatal error during startup and is unavailable.")
+        return
+        
+    if not getattr(bs, 'is_ready', False):
+        await update.message.reply_text("⏳ Browser Gemini session is still initializing or restarting. Please try again in a moment.")
+        return
+
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='upload_document')
+    
+    file_id = None
+    mime_type = "image/jpeg" # Default guess
+    
+    if update.message.photo:
+        file_id = update.message.photo[-1].file_id # Get highest res
+    elif update.message.document:
+        file_id = update.message.document.file_id
+        mime_type = update.message.document.mime_type or "image/jpeg"
+        
+    if not file_id:
+        return
+
+    try:
+        new_file = await context.bot.get_file(file_id)
+        # Download as byte array
+        import io
+        import base64
+        byte_arr = io.BytesIO()
+        await new_file.download_to_memory(byte_arr)
+        
+        base64_data = base64.b64encode(byte_arr.getvalue()).decode('utf-8')
+        
+        await update.message.reply_text("Uploading file to Gemini Browser...")
+        success = await bs.upload_file_async(base64_data, mime_type)
+        
+        if not success:
+            await update.message.reply_text("❌ Failed to inject the image into the Gemini browser session.")
+            return
+            
+        # If there's a caption, send it as a prompt, otherwise just say "What's this?"
+        prompt = update.message.caption or "What's in this image?"
+        
+        await update.message.reply_text(f"File uploaded. Sending prompt: '{prompt}'...")
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
+        reply_text = await bs.generate_content_async(prompt, timeout=60)
+        
+        if reply_text:
+            await update.message.reply_text(reply_text)
+        else:
+            await update.message.reply_text("Wait, the response came back empty. Did the browser session get stuck?")
+
+    except Exception as e:
+        print(f"Error handling media: {e}", file=sys.stderr)
+        await update.message.reply_text(f"❌ Error processing media: {e}")
+
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle incoming audio/voice messages."""
     print(f"Received audio from {update.effective_user.first_name}")
@@ -958,7 +1029,24 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             
             if not bs.is_ready:
-                await update.message.reply_text(f"❌ Browser Gemini session is not ready. Details: {bs.init_error or 'Unknown error during initialization.'}")
+                # Attempt to restart it if dead
+                if 'browser_session_restarting' not in context.bot_data:
+                    context.bot_data['browser_session_restarting'] = True
+                    await update.message.reply_text("🔄 Browser session was closed or crashed. Restarting it now, please wait 15 seconds and try again...")
+                    
+                    async def _restart_task():
+                        try:
+                            new_bs = await getattr(asyncio.get_running_loop(), 'run_in_executor')(None, init_bs)
+                            context.bot_data['browser_session'] = new_bs
+                        except Exception as e:
+                            print(f"Failed to restart browser session: {e}")
+                        finally:
+                            if 'browser_session_restarting' in context.bot_data:
+                                del context.bot_data['browser_session_restarting']
+                    
+                    asyncio.create_task(_restart_task())
+                else:
+                    await update.message.reply_text("⏳ Still restarting the Browser Gemini session... please wait a moment.")
                 return
                 
             reply_text = await bs.generate_content_async(final_prompt, timeout=60)
@@ -998,18 +1086,19 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"Error processing audio message: {e}", file=sys.stderr)
         await update.message.reply_text("Sorry, I encountered an error while processing your audio.")
 
+def init_bs():
+    """Initializes the browser session."""
+    # Set headless=False so the user can literally see the window and login if needed.
+    # Once logged in, they can change this back to True.
+    return BrowserGeminiSession(
+        headless=False, 
+        profile_path=CHROME_PROFILE_PATH
+    )
+
 async def post_init(application: Application):
     """Initialize background services when the bot starts."""
     print("Pre-initializing Browser Gemini session in the background...")
     
-    def init_bs():
-        # Set headless=False so the user can literally see the window and login if needed.
-        # Once logged in, they can change this back to True.
-        return BrowserGeminiSession(
-            headless=False, 
-            profile_path=CHROME_PROFILE_PATH
-        )
-        
     loop = asyncio.get_running_loop()
     application.bot_data['browser_session_started'] = True
     
@@ -1076,6 +1165,7 @@ def main():
 
     # on non command i.e message - echo the message on Telegram
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, handle_media))
     application.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_audio))
 
     # Run the bot until the user presses Ctrl-C

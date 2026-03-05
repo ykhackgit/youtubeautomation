@@ -63,8 +63,18 @@ class BrowserGeminiSession:
         Synchronously sends a prompt to Gemini and waits for the response.
         Should be run inside an executor to avoid blocking async loops.
         """
-        if not self.is_ready:
-            return "Error: Gemini browser session is not authenticated or failed to load. Please check credentials or run without headless mode to login."
+        try:
+            # Check if the driver is still alive before doing anything
+            self.driver.current_url
+        except Exception:
+            self.is_ready = False
+            return "Error: The Chrome browser window was closed or crashed. Please restart the bot."
+            
+        if getattr(self, 'init_error', None):
+             return f"Error: Browser session failed to start properly. Details: {self.init_error}"
+             
+        if not getattr(self, 'is_ready', False):
+            return "Error: Gemini browser session is not authenticated or failed to load."
 
         # Periodic refresh
         self.chat_count += 1
@@ -119,25 +129,29 @@ class BrowserGeminiSession:
                 
             time.sleep(1) # wait for animation to start
             
-            # 4. Wait for generation to complete
-            # We assume it's generating as long as the "Stop generating" or a loading indicator is present
-            # Alternatively, we can wait for the latest message bubble to stop changing length
+            # Track how many responses exist before generation starts
+            initial_responses = len(self.driver.find_elements(By.TAG_NAME, "model-response"))
             
-            # Wait for at least one response bubble to appear
-            WebDriverWait(self.driver, timeout).until(
-                EC.presence_of_element_located((By.TAG_NAME, "model-response"))
-            )
-            
-            # A simple loop to check when it stops typing
-            responses = self.driver.find_elements(By.TAG_NAME, "model-response")
-            last_response = responses[-1]
+            # Wait for a new response bubble to appear
+            start_time = time.time()
+            while len(self.driver.find_elements(By.TAG_NAME, "model-response")) <= initial_responses:
+                if time.time() - start_time > 15: # 15s wait for start
+                    return "Error: Timed out waiting for Gemini to start responding."
+                time.sleep(0.5)
             
             previous_text = ""
             stable_count = 0
             
             start_time = time.time()
             while time.time() - start_time < timeout:
+                # Re-fetch the last response inside the loop to ensure we get dynamic DOM updates
+                responses = self.driver.find_elements(By.TAG_NAME, "model-response")
+                if not responses:
+                    continue
+                    
+                last_response = responses[-1]
                 current_text = last_response.text
+                
                 if current_text and current_text == previous_text:
                     stable_count += 1
                 else:
@@ -160,6 +174,48 @@ class BrowserGeminiSession:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, lambda: self.generate_content_sync(prompt, timeout))
         
+    def upload_file_sync(self, base64_data: str, mime_type: str = "image/jpeg") -> bool:
+        """Injects a file directly into the Gemini chat box using a simulated clipboard paste."""
+        if not getattr(self, 'is_ready', False):
+            return False
+            
+        js_script = """
+        async function pasteImage(base64Data, mimeType) {
+            try {
+                const res = await fetch(`data:${mimeType};base64,${base64Data}`);
+                const blob = await res.blob();
+                const file = new File([blob], "upload.jpg", {type: mimeType});
+                const dt = new DataTransfer();
+                dt.items.add(file);
+                
+                const el = document.querySelector('.ql-editor') || document.querySelector('rich-textarea p');
+                if (el) {
+                    let e = new ClipboardEvent('paste', {
+                        clipboardData: dt,
+                        bubbles: true,
+                        cancelable: true
+                    });
+                    el.dispatchEvent(e);
+                    return true;
+                }
+                return false;
+            } catch (err) {
+                return false;
+            }
+        }
+        return await pasteImage(arguments[0], arguments[1]);
+        """
+        try:
+            return self.driver.execute_script(js_script, base64_data, mime_type)
+        except Exception as e:
+            print(f"File upload to browser failed: {e}", file=sys.stderr)
+            return False
+
+    async def upload_file_async(self, base64_data: str, mime_type: str = "image/jpeg") -> bool:
+        """Asynchronous wrapper for upload_file_sync."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, lambda: self.upload_file_sync(base64_data, mime_type))
+
     def close(self):
         """Clean up the browser session."""
         try:
